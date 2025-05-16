@@ -1,0 +1,217 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+/**
+ * @title InsurancePool
+ * @dev A smart contract for a decentralized insurance platform where users can create and participate in insurance pools.
+ */
+contract InsurancePool is Ownable, ReentrancyGuard {
+    struct Pool {
+        string name;
+        string riskType;
+        uint256 totalFunds;
+        uint256 premiumAmount;
+        uint256 coverageAmount;
+        uint256 minMembers;
+        uint256 duration;
+        uint256 createdAt;
+        bool active;
+        address[] members;
+        mapping(address => bool) isMember;
+        mapping(address => uint256) premiumPaid;
+    }
+
+    struct Claim {
+        address claimant;
+        uint256 poolId;
+        uint256 amount;
+        string evidence;
+        uint256 approvalCount;
+        uint256 rejectionCount;
+        bool resolved;
+        bool approved;
+        mapping(address => bool) hasVoted;
+    }
+
+    uint256 private poolCount;
+    uint256 private claimCount;
+    mapping(uint256 => Pool) public pools;
+    mapping(uint256 => Claim) public claims;
+    mapping(address => uint256[]) private userPools;
+    mapping(address => uint256[]) private userClaims;
+
+    event PoolCreated(uint256 indexed poolId, string name, string riskType, address creator);
+    event MemberJoined(uint256 indexed poolId, address member);
+    event PremiumPaid(uint256 indexed poolId, address member, uint256 amount);
+    event ClaimSubmitted(uint256 indexed claimId, uint256 poolId, address claimant, uint256 amount);
+    event ClaimVoted(uint256 indexed claimId, address voter, bool approved);
+    event ClaimResolved(uint256 indexed claimId, bool approved, uint256 amount);
+    event PoolActivated(uint256 indexed poolId);
+    event PoolDeactivated(uint256 indexed poolId);
+
+    constructor() Ownable(msg.sender) {}
+
+    /**
+     * @dev Creates a new insurance pool
+     * @param _name Name of the insurance pool
+     * @param _riskType Type of risk covered
+     * @param _premiumAmount Amount of premium to be paid by each member
+     * @param _coverageAmount Maximum coverage amount per claim
+     * @param _minMembers Minimum number of members required to activate the pool
+     * @param _duration Duration of the pool in days
+     */
+    function createPool(
+        string memory _name,
+        string memory _riskType,
+        uint256 _premiumAmount,
+        uint256 _coverageAmount,
+        uint256 _minMembers,
+        uint256 _duration
+    ) external {
+        require(_premiumAmount > 0, "Premium must be greater than 0");
+        require(_coverageAmount > 0, "Coverage must be greater than 0");
+        require(_minMembers > 1, "Minimum members must be greater than 1");
+        require(_duration > 0, "Duration must be greater than 0");
+
+        poolCount++;
+        Pool storage newPool = pools[poolCount];
+        newPool.name = _name;
+        newPool.riskType = _riskType;
+        newPool.premiumAmount = _premiumAmount;
+        newPool.coverageAmount = _coverageAmount;
+        newPool.minMembers = _minMembers;
+        newPool.duration = _duration * 1 days;
+        newPool.createdAt = block.timestamp;
+        newPool.active = false;
+
+        // Add creator as first member
+        newPool.members.push(msg.sender);
+        newPool.isMember[msg.sender] = true;
+        userPools[msg.sender].push(poolCount);
+
+        emit PoolCreated(poolCount, _name, _riskType, msg.sender);
+    }
+
+    /**
+     * @dev Allows users to join an insurance pool and pay premium
+     * @param _poolId ID of the pool to join
+     */
+    function joinPool(uint256 _poolId) external payable nonReentrant {
+        Pool storage pool = pools[_poolId];
+        
+        require(pool.createdAt > 0, "Pool does not exist");
+        require(!pool.isMember[msg.sender], "Already a member");
+        require(msg.value == pool.premiumAmount, "Incorrect premium amount");
+        require(block.timestamp < pool.createdAt + pool.duration, "Pool duration ended");
+
+        // Add member to pool
+        pool.members.push(msg.sender);
+        pool.isMember[msg.sender] = true;
+        pool.premiumPaid[msg.sender] = msg.value;
+        pool.totalFunds += msg.value;
+        userPools[msg.sender].push(_poolId);
+
+        emit MemberJoined(_poolId, msg.sender);
+        emit PremiumPaid(_poolId, msg.sender, msg.value);
+
+        // Activate pool if minimum members reached
+        if (!pool.active && pool.members.length >= pool.minMembers) {
+            pool.active = true;
+            emit PoolActivated(_poolId);
+        }
+    }
+
+    /**
+     * @dev Allows members to submit insurance claims
+     * @param _poolId ID of the pool to claim from
+     * @param _amount Amount to claim
+     * @param _evidence IPFS hash or other reference to claim evidence
+     */
+    function submitClaim(uint256 _poolId, uint256 _amount, string memory _evidence) external {
+        Pool storage pool = pools[_poolId];
+        
+        require(pool.isMember[msg.sender], "Not a member of this pool");
+        require(pool.active, "Pool is not active");
+        require(_amount <= pool.coverageAmount, "Amount exceeds coverage limit");
+        require(block.timestamp < pool.createdAt + pool.duration, "Pool has expired");
+        require(pool.totalFunds >= _amount, "Insufficient funds in pool");
+
+        claimCount++;
+        Claim storage newClaim = claims[claimCount];
+        newClaim.claimant = msg.sender;
+        newClaim.poolId = _poolId;
+        newClaim.amount = _amount;
+        newClaim.evidence = _evidence;
+        newClaim.resolved = false;
+        newClaim.approved = false;
+
+        userClaims[msg.sender].push(claimCount);
+
+        emit ClaimSubmitted(claimCount, _poolId, msg.sender, _amount);
+    }
+
+    /**
+     * @dev Gets the total number of pools created
+     * @return The total number of pools
+     */
+    function getPoolCount() external view returns (uint256) {
+        return poolCount;
+    }
+
+    /**
+     * @dev Gets pools that a user is a member of
+     * @param _user Address of the user
+     * @return Array of pool IDs
+     */
+    function getUserPools(address _user) external view returns (uint256[] memory) {
+        return userPools[_user];
+    }
+
+    /**
+     * @dev Gets claims submitted by a user
+     * @param _user Address of the user
+     * @return Array of claim IDs
+     */
+    function getUserClaims(address _user) external view returns (uint256[] memory) {
+        return userClaims[_user];
+    }
+
+    /**
+     * @dev Gets members of a specific pool
+     * @param _poolId ID of the pool
+     * @return Array of member addresses
+     */
+    function getPoolMembers(uint256 _poolId) external view returns (address[] memory) {
+        return pools[_poolId].members;
+    }
+
+    /**
+     * @dev Gets basic pool information
+     * @param _poolId ID of the pool
+     * @return name Name of the pool
+     * @return riskType Type of risk covered
+     * @return totalFunds Total funds in the pool
+     * @return memberCount Number of members in the pool
+     * @return active Whether the pool is active
+     */
+    function getPoolInfo(uint256 _poolId) external view returns (
+        string memory name,
+        string memory riskType,
+        uint256 totalFunds,
+        uint256 memberCount,
+        bool active
+    ) {
+        Pool storage pool = pools[_poolId];
+        return (
+            pool.name,
+            pool.riskType,
+            pool.totalFunds,
+            pool.members.length,
+            pool.active
+        );
+    }
+}
